@@ -2,7 +2,8 @@
 import { Asset, AssetCategory } from "../types";
 
 // Helper to determine category from string
-const parseCategory = (cat: string): AssetCategory => {
+const parseCategory = (cat: unknown): AssetCategory => {
+  const normalized = String(cat ?? '').trim();
   const map: Record<string, AssetCategory> = {
     'Stock': AssetCategory.Stock,
     'Bond': AssetCategory.Bond,
@@ -15,7 +16,12 @@ const parseCategory = (cat: string): AssetCategory => {
     'Personal Loan': AssetCategory.PersonalLoan
   };
   // Default to Stock if unknown
-  return map[cat] || Object.values(AssetCategory).find(c => c.toLowerCase() === cat.toLowerCase()) || AssetCategory.Stock;
+  return map[normalized] || Object.values(AssetCategory).find(c => c.toLowerCase() === normalized.toLowerCase()) || AssetCategory.Stock;
+};
+
+const parseNum = (val: unknown): number => {
+  const parsed = Number.parseFloat(String(val ?? '0').replace(/[$,%]/g, '').replace(/,/g, ''));
+  return Number.isFinite(parsed) ? parsed : 0;
 };
 
 export const fetchSheetData = async (spreadsheetId: string, range: string): Promise<Asset[]> => {
@@ -25,11 +31,15 @@ export const fetchSheetData = async (spreadsheetId: string, range: string): Prom
     throw new Error("Missing API Key or Spreadsheet ID");
   }
 
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${range}?key=${apiKey}`;
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(range)}?key=${apiKey}`;
 
   try {
     const response = await fetch(url);
     const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data.error?.message || `Sheets API request failed (${response.status})`);
+    }
 
     if (data.error) {
       throw new Error(data.error.message);
@@ -43,10 +53,6 @@ export const fetchSheetData = async (spreadsheetId: string, range: string): Prom
     // A: Symbol, B: Name, C: Category, D: Location, E: Qty, F: Price, G: CostBasis, H: 24h%, I: Target, J: APY, K: IsCollateral (TRUE/FALSE)
     
     return data.values.map((row: any[], index: number) => {
-      const isLiability = ['Loan', 'Credit Card', 'Personal Loan'].some(c => c === row[2]);
-      // Price parsing: Remove '$' or ',' if present
-      const parseNum = (val: string) => parseFloat((val || '0').toString().replace(/[$,]/g, ''));
-      
       const price = parseNum(row[5]);
       const qty = parseNum(row[4]);
       
