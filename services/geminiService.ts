@@ -2,14 +2,20 @@
 import { GoogleGenAI } from "@google/genai";
 import { Asset, Language, AssetCategory } from "../types";
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-
 const isLiability = (category: AssetCategory) => {
   return [AssetCategory.Loan, AssetCategory.CreditCard, AssetCategory.PersonalLoan].includes(category);
 };
 
 export const analyzePortfolio = async (assets: Asset[], netWorth: number, language: Language): Promise<string> => {
   try {
+    const apiKey = process.env.API_KEY || process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return language === 'zh'
+        ? "尚未設定 Gemini API Key。請先在 `.env.local` 設定 `GEMINI_API_KEY`，再重新啟動開發伺服器。"
+        : "Gemini API key is not configured. Set `GEMINI_API_KEY` in `.env.local`, then restart the dev server.";
+    }
+
+    const ai = new GoogleGenAI({ apiKey });
     const totalAssets = assets
       .filter(a => !isLiability(a.category))
       .reduce((sum, a) => sum + (a.quantity * a.currentPrice), 0);
