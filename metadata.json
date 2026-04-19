@@ -1,5 +1,5 @@
 {
   "name": "PortfolioSync & Balance",
-  "description": "A sophisticated asset tracker and portfolio rebalancing tool. Connects with your data to visualize net worth, track allocation targets, and receive AI-driven financial insights.",
+  "description": "A portfolio tracker for reviewing assets, liabilities, allocation drift, collateral groups, and optional AI-assisted risk notes.",
   "requestFramePermissions": []
 }
