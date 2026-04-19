@@ -1,14 +1,14 @@
 
-import React, { useState, useMemo, useEffect } from 'react';
-import { 
-  LayoutDashboard, 
-  ArrowRightLeft, 
-  Settings, 
-  Plus, 
-  Trash2, 
-  RefreshCw, 
-  TrendingUp, 
-  Wallet, 
+import React, { useState, useMemo, useRef } from 'react';
+import {
+  LayoutDashboard,
+  ArrowRightLeft,
+  Settings,
+  Plus,
+  Trash2,
+  RefreshCw,
+  TrendingUp,
+  Wallet,
   BrainCircuit,
   FileSpreadsheet,
   Download,
@@ -31,11 +31,11 @@ import {
   Save,
   Link as LinkIcon
 } from 'lucide-react';
-import { 
-  PieChart as RePieChart, 
-  Pie, 
-  Cell, 
-  ResponsiveContainer, 
+import {
+  PieChart as RePieChart,
+  Pie,
+  Cell,
+  ResponsiveContainer,
   Tooltip as ReTooltip,
   Legend,
   BarChart,
@@ -47,13 +47,176 @@ import {
   AreaChart,
   Area
 } from 'recharts';
-import { Asset, AssetCategory, ViewState, RebalanceAction, Language } from './types';
+import { Asset, AssetCategory, ViewState, RebalanceAction, Language, SheetConfig } from './types';
 import { analyzePortfolio } from './services/geminiService';
 import { fetchSheetData } from './services/sheetService';
 
 // --- Helpers ---
 const isLiability = (category: AssetCategory) => {
   return [AssetCategory.Loan, AssetCategory.CreditCard, AssetCategory.PersonalLoan].includes(category);
+};
+
+const DEFAULT_SHEET_RANGE = 'Sheet1!A2:M';
+const SHEET_CONFIG_STORAGE_KEY = 'portfolioSyncBalance.sheetConfig';
+const CSV_HEADERS = [
+  'Symbol',
+  'Name',
+  'Category',
+  'Location',
+  'Qty',
+  'Price',
+  'CostBasis',
+  '24h%',
+  'Target',
+  'APY',
+  'IsCollateral',
+  'MaxLTV',
+  'LiquidationThreshold'
+];
+
+const toFiniteNumber = (value: unknown, fallback = 0): number => {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : fallback;
+  }
+
+  const parsed = Number.parseFloat(String(value ?? '').replace(/[$,%]/g, '').replace(/,/g, ''));
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const parseAssetCategory = (value: unknown): AssetCategory => {
+  const normalized = String(value ?? '').trim();
+  return Object.values(AssetCategory).find(category => category.toLowerCase() === normalized.toLowerCase()) || AssetCategory.Stock;
+};
+
+const parseBoolean = (value: unknown): boolean => {
+  return ['1', 'true', 'yes', 'y', '是', '質押'].includes(String(value ?? '').trim().toLowerCase());
+};
+
+const loadSheetConfig = (): SheetConfig => {
+  const defaultConfig = { spreadsheetId: '', range: DEFAULT_SHEET_RANGE };
+  if (typeof window === 'undefined') return defaultConfig;
+
+  try {
+    const saved = window.localStorage.getItem(SHEET_CONFIG_STORAGE_KEY);
+    if (!saved) return defaultConfig;
+
+    const parsed = JSON.parse(saved) as Partial<SheetConfig>;
+    return {
+      spreadsheetId: parsed.spreadsheetId || '',
+      range: parsed.range || DEFAULT_SHEET_RANGE
+    };
+  } catch {
+    return defaultConfig;
+  }
+};
+
+const saveSheetConfig = (config: SheetConfig): void => {
+  if (typeof window === 'undefined') return;
+  window.localStorage.setItem(SHEET_CONFIG_STORAGE_KEY, JSON.stringify(config));
+};
+
+const escapeCsvValue = (value: unknown): string => {
+  const text = String(value ?? '');
+  if (/[",\r\n]/.test(text)) {
+    return `"${text.replace(/"/g, '""')}"`;
+  }
+  return text;
+};
+
+const assetsToCsv = (assets: Asset[]): string => {
+  const rows = assets.map(asset => [
+    asset.symbol,
+    asset.name,
+    asset.category,
+    asset.location || '',
+    asset.quantity,
+    asset.currentPrice,
+    asset.costBasis,
+    asset.change24h,
+    asset.targetAllocation,
+    asset.interestRate,
+    asset.isCollateral,
+    asset.maxLTV ?? '',
+    asset.liquidationThreshold ?? ''
+  ]);
+
+  return [CSV_HEADERS, ...rows]
+    .map(row => row.map(escapeCsvValue).join(','))
+    .join('\r\n');
+};
+
+const parseCsvRows = (csvText: string): string[][] => {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < csvText.length; i += 1) {
+    const char = csvText[i];
+    const nextChar = csvText[i + 1];
+
+    if (char === '"') {
+      if (inQuotes && nextChar === '"') {
+        cell += '"';
+        i += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (char === ',' && !inQuotes) {
+      row.push(cell);
+      cell = '';
+    } else if ((char === '\n' || char === '\r') && !inQuotes) {
+      if (char === '\r' && nextChar === '\n') i += 1;
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = '';
+    } else {
+      cell += char;
+    }
+  }
+
+  row.push(cell);
+  rows.push(row);
+
+  return rows.filter(csvRow => csvRow.some(value => value.trim() !== ''));
+};
+
+const normalizeHeader = (value: string): string => value.trim().toLowerCase().replace(/[\s_%/-]/g, '');
+
+const parseAssetsFromCsv = (csvText: string): Asset[] => {
+  const rows = parseCsvRows(csvText);
+  if (rows.length === 0) return [];
+
+  const firstRowHeaders = rows[0].map(normalizeHeader);
+  const hasHeader = firstRowHeaders.includes('symbol') || firstRowHeaders.includes('代碼');
+  const headerMap = new Map(firstRowHeaders.map((header, index) => [header, index]));
+  const dataRows = hasHeader ? rows.slice(1) : rows;
+
+  const readCell = (row: string[], aliases: string[], fallbackIndex: number): string => {
+    for (const alias of aliases.map(normalizeHeader)) {
+      const index = headerMap.get(alias);
+      if (index !== undefined) return row[index] ?? '';
+    }
+    return row[fallbackIndex] ?? '';
+  };
+
+  return dataRows.map((row, index) => ({
+    id: `csv-${Date.now()}-${index}`,
+    symbol: readCell(row, ['Symbol', '代碼'], 0) || 'UNK',
+    name: readCell(row, ['Name', '名稱'], 1) || 'Unknown Asset',
+    category: parseAssetCategory(readCell(row, ['Category', '類別'], 2)),
+    location: readCell(row, ['Location', 'Location / Platform', '地點 / 平台'], 3) || 'General',
+    quantity: toFiniteNumber(readCell(row, ['Qty', 'Quantity', '數量'], 4)),
+    currentPrice: toFiniteNumber(readCell(row, ['Price', 'CurrentPrice', '市價'], 5)),
+    costBasis: toFiniteNumber(readCell(row, ['CostBasis', 'Avg Cost', 'Cost', '均價'], 6)),
+    change24h: toFiniteNumber(readCell(row, ['24h%', '24h', 'Change', '24h %'], 7)),
+    targetAllocation: toFiniteNumber(readCell(row, ['Target', 'TargetAllocation', 'Target %', '目標 %'], 8)),
+    interestRate: toFiniteNumber(readCell(row, ['APY', 'APR', 'InterestRate', '利率 %'], 9)),
+    isCollateral: parseBoolean(readCell(row, ['IsCollateral', 'Collateral', '質押'], 10)),
+    maxLTV: toFiniteNumber(readCell(row, ['MaxLTV', 'Max LTV %', '借貸上限 %'], 11), 50),
+    liquidationThreshold: toFiniteNumber(readCell(row, ['LiquidationThreshold', 'Liq %', '清算線 %'], 12), 80)
+  }));
 };
 
 // --- Translations ---
@@ -331,19 +494,19 @@ const translations = {
 
 // --- Components ---
 
-const Sidebar = ({ 
-  currentView, 
-  setView, 
-  language, 
-  setLanguage 
-}: { 
-  currentView: ViewState, 
+const Sidebar = ({
+  currentView,
+  setView,
+  language,
+  setLanguage
+}: {
+  currentView: ViewState,
   setView: (v: ViewState) => void,
   language: Language,
   setLanguage: (l: Language) => void
 }) => {
   const t = translations[language].nav;
-  
+
   const menuItems = [
     { id: 'dashboard', label: t.dashboard, icon: LayoutDashboard },
     { id: 'assets', label: t.assets, icon: Wallet },
@@ -372,9 +535,9 @@ const Sidebar = ({
           </button>
         ))}
       </nav>
-      
+
       <div className="p-4 border-t border-slate-700">
-        <button 
+        <button
           onClick={() => setLanguage(language === 'en' ? 'zh' : 'en')}
           className="w-full flex items-center justify-center md:justify-start gap-3 p-2 rounded-lg hover:bg-slate-700 text-slate-400 hover:text-white transition-colors"
         >
@@ -403,16 +566,16 @@ const StatCard = ({ title, value, subtext, trend, valueColor = 'text-white' }: {
 );
 
 // New component for performance metrics (PnL, YTD, MoM)
-const MetricCard = ({ 
-  title, 
-  value, 
-  percent, 
-  isCurrency = true 
-}: { 
-  title: string, 
-  value: number, 
-  percent?: number, 
-  isCurrency?: boolean 
+const MetricCard = ({
+  title,
+  value,
+  percent,
+  isCurrency = true
+}: {
+  title: string,
+  value: number,
+  percent?: number,
+  isCurrency?: boolean
 }) => {
   const isPositive = value >= 0;
   const colorClass = isPositive ? 'text-emerald-400' : 'text-red-400';
@@ -444,24 +607,24 @@ const MetricCard = ({
 };
 
 // --- Pledge Risk Group Card ---
-const RiskGroupCard = ({ 
-  location, 
-  assets, 
-  language 
-}: { 
-  location: string, 
-  assets: Asset[], 
-  language: Language 
+const RiskGroupCard = ({
+  location,
+  assets,
+  language
+}: {
+  location: string,
+  assets: Asset[],
+  language: Language
 }) => {
   const t = translations[language].pledge;
-  
+
   // Separation of assets within the group
   const collateralAssets = assets.filter(a => a.isCollateral && !isLiability(a.category));
   const loanAssets = assets.filter(a => a.category === AssetCategory.Loan); // Margin/Secured Loans
-  
+
   const totalCollateralValue = collateralAssets.reduce((sum, a) => sum + (a.quantity * a.currentPrice), 0);
   const totalDebt = loanAssets.reduce((sum, a) => sum + (a.quantity * a.currentPrice), 0);
-  
+
   // Calculate Weighted Limits
   const weightedMaxBorrow = collateralAssets.reduce((sum, a) => sum + (a.quantity * a.currentPrice * ((a.maxLTV || 0) / 100)), 0);
   const weightedLiqPoint = collateralAssets.reduce((sum, a) => sum + (a.quantity * a.currentPrice * ((a.liquidationThreshold || 0) / 100)), 0);
@@ -478,7 +641,7 @@ const RiskGroupCard = ({
   let riskLabel = t.safe;
   let RiskIcon = ShieldCheck;
 
-  // Logic: 
+  // Logic:
   // Safe: Debt < Max Borrow
   // Warning: Debt > Max Borrow BUT < Liquidation Point
   // Danger: Debt >= Liquidation Point
@@ -514,7 +677,7 @@ const RiskGroupCard = ({
       </div>
 
       <div className="p-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
-        
+
         {/* Gauge Viz */}
         <div className="flex flex-col justify-center gap-4">
            {/* Summary Text */}
@@ -541,10 +704,10 @@ const RiskGroupCard = ({
                  <div className="absolute top-0 bottom-0 bg-amber-500/10 border-l border-amber-500/30" style={{ left: `${maxLTVPercent}%`, width: `${liqLTVPercent - maxLTVPercent}%` }}></div>
                  {/* Danger Zone Marker */}
                  <div className="absolute top-0 bottom-0 bg-red-500/10 border-l border-red-500/30" style={{ left: `${liqLTVPercent}%`, right: 0 }}></div>
-                 
+
                  {/* Actual Debt Bar */}
-                 <div 
-                   className={`h-full transition-all duration-700 ${riskBg}`} 
+                 <div
+                   className={`h-full transition-all duration-700 ${riskBg}`}
                    style={{ width: `${Math.min((totalDebt / totalCollateralValue) * 100, 100)}%` }}
                  ></div>
              </div>
@@ -555,7 +718,7 @@ const RiskGroupCard = ({
                 )}
              </div>
            </div>
-           
+
            {/* Limit Details */}
            <div className="grid grid-cols-2 gap-2 text-xs bg-slate-900/30 p-2 rounded">
               <div className="flex justify-between">
@@ -575,7 +738,7 @@ const RiskGroupCard = ({
             <Lock size={12} /> {t.pledgedAssets}
           </h4>
           <div className="space-y-2 max-h-40 overflow-y-auto pr-1">
-            {collateralAssets.length === 0 ? <p className="text-xs text-slate-600 italic">{t.noCollateral}</p> : 
+            {collateralAssets.length === 0 ? <p className="text-xs text-slate-600 italic">{t.noCollateral}</p> :
               collateralAssets.map(a => (
                 <div key={a.id} className="flex flex-col p-2 bg-slate-800/50 rounded border border-slate-700/50">
                   <div className="flex justify-between text-sm mb-1">
@@ -598,7 +761,7 @@ const RiskGroupCard = ({
             <Landmark size={12} /> {t.activeLoans}
           </h4>
           <div className="space-y-2 max-h-40 overflow-y-auto">
-             {loanAssets.length === 0 ? <p className="text-xs text-slate-600 italic">{t.noLoans}</p> : 
+             {loanAssets.length === 0 ? <p className="text-xs text-slate-600 italic">{t.noLoans}</p> :
               loanAssets.map(a => (
                 <div key={a.id} className="flex justify-between items-center p-2 bg-slate-800/50 rounded border border-slate-700/50">
                   <div>
@@ -639,11 +802,11 @@ const PledgeDashboard = ({ assets, updateAsset, language }: { assets: Asset[], u
 
       {/* Render Risk Group Cards for each Location */}
       {locations.map((loc, idx) => (
-        <RiskGroupCard 
-          key={idx} 
-          location={loc} 
-          assets={assets.filter(a => (a.location || '') === loc)} 
-          language={language} 
+        <RiskGroupCard
+          key={idx}
+          location={loc}
+          assets={assets.filter(a => (a.location || '') === loc)}
+          language={language}
         />
       ))}
 
@@ -686,14 +849,18 @@ const PledgeDashboard = ({ assets, updateAsset, language }: { assets: Asset[], u
 export default function App() {
   const [view, setView] = useState<ViewState>('dashboard');
   const [assetSubView, setAssetSubView] = useState<'list' | 'pledge'>('list');
-  const [language, setLanguage] = useState<Language>('zh'); 
+  const [language, setLanguage] = useState<Language>('zh');
   const [isSyncing, setIsSyncing] = useState(false);
   const [aiAnalysis, setAiAnalysis] = useState<string | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
-  
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
   // Sheet Settings
-  const [sheetId, setSheetId] = useState('');
-  const [sheetRange, setSheetRange] = useState('Sheet1!A2:M');
+  const [sheetConfig, setSheetConfig] = useState<SheetConfig>(() => loadSheetConfig());
+  const sheetId = sheetConfig.spreadsheetId;
+  const sheetRange = sheetConfig.range;
+  const setSheetId = (spreadsheetId: string) => setSheetConfig(prev => ({ ...prev, spreadsheetId }));
+  const setSheetRange = (range: string) => setSheetConfig(prev => ({ ...prev, range }));
 
   const t = translations[language];
 
@@ -702,14 +869,14 @@ export default function App() {
     // Interactive Brokers Group (Stocks/ETF often have ~50% Margin Req, 75% Maintenance)
     { id: '1', name: 'Vanguard Total World', symbol: 'VT', category: AssetCategory.ETF, quantity: 400, currentPrice: 110, costBasis: 102, change24h: 0.5, targetAllocation: 40, interestRate: 0, isCollateral: true, maxLTV: 50, liquidationThreshold: 75, location: 'Interactive Brokers' },
     { id: '2', name: 'Margin Loan (IBKR)', symbol: 'USD-LOAN', category: AssetCategory.Loan, quantity: 15000, currentPrice: 1, costBasis: 1, change24h: 0, targetAllocation: 0, interestRate: 6.8, isCollateral: false, location: 'Interactive Brokers' },
-    
+
     // Binance Group (Crypto has lower Max LTV, Higher Volatility)
     { id: '3', name: 'Bitcoin', symbol: 'BTC', category: AssetCategory.Crypto, quantity: 0.5, currentPrice: 62000, costBasis: 55000, change24h: 2.1, targetAllocation: 20, interestRate: 0, isCollateral: true, maxLTV: 60, liquidationThreshold: 80, location: 'Binance' },
     { id: '4', name: 'USDT Loan', symbol: 'USDT', category: AssetCategory.Loan, quantity: 12000, currentPrice: 1, costBasis: 1, change24h: 0, targetAllocation: 0, interestRate: 8.5, isCollateral: false, location: 'Binance' },
 
     // General / Unassigned
     { id: '5', name: 'High Yield Savings', symbol: 'USD', category: AssetCategory.Cash, quantity: 20000, currentPrice: 1, costBasis: 1, change24h: 0, targetAllocation: 20, interestRate: 4.5, isCollateral: false, location: 'Chase Bank' },
-    
+
     // Liabilities
     { id: '6', name: 'Visa Signature', symbol: 'VISA', category: AssetCategory.CreditCard, quantity: 3500, currentPrice: 1, costBasis: 1, change24h: 0, targetAllocation: 0, interestRate: 18.0, isCollateral: false, location: 'Chase Bank' },
     { id: '7', name: 'Personal Loan', symbol: 'LN-01', category: AssetCategory.PersonalLoan, quantity: 10000, currentPrice: 1, costBasis: 1, change24h: 0, targetAllocation: 0, interestRate: 5.5, isCollateral: false, location: 'SoFi' },
@@ -719,7 +886,7 @@ export default function App() {
   const totalAssets = useMemo(() => assets.filter(a => !isLiability(a.category)).reduce((sum, a) => sum + (a.quantity * a.currentPrice), 0), [assets]);
   const totalLiabilities = useMemo(() => assets.filter(a => isLiability(a.category)).reduce((sum, a) => sum + (a.quantity * a.currentPrice), 0), [assets]);
   const netWorth = totalAssets - totalLiabilities;
-  
+
   // Advanced PnL Metrics
   const dailyPnL = useMemo(() => {
     return assets.reduce((sum, a) => {
@@ -733,15 +900,15 @@ export default function App() {
   const totalPnL = useMemo(() => {
     return assets.reduce((sum, a) => {
       if (isLiability(a.category)) return sum;
-      if (!a.costBasis) return sum; 
+      if (!a.costBasis) return sum;
       return sum + ((a.currentPrice - a.costBasis) * a.quantity);
     }, 0);
   }, [assets]);
 
   // Simulated YTD (Assumption: 60% of total PnL happened this year for visualization)
-  const ytdPnL = totalPnL * 0.6; 
+  const ytdPnL = totalPnL * 0.6;
   const ytdPercent = totalAssets > 0 ? (ytdPnL / (totalAssets - ytdPnL)) * 100 : 0;
-  
+
   // Cash Flow Calculations
   const monthlyIncome = useMemo(() => assets.filter(a => !isLiability(a.category)).reduce((sum, a) => sum + (a.quantity * a.currentPrice * (a.interestRate / 100) / 12), 0), [assets]);
   const monthlyInterest = useMemo(() => assets.filter(a => isLiability(a.category)).reduce((sum, a) => sum + (a.quantity * a.currentPrice * (a.interestRate / 100) / 12), 0), [assets]);
@@ -763,7 +930,7 @@ export default function App() {
     const unsecuredDebt = assets.filter(a => a.category === AssetCategory.CreditCard || a.category === AssetCategory.PersonalLoan).reduce((s, a) => s + (a.quantity * a.currentPrice), 0);
 
     return [
-      { name: t.dashboard.liquid, value: liquid, fill: '#10b981' }, 
+      { name: t.dashboard.liquid, value: liquid, fill: '#10b981' },
       { name: t.dashboard.collateral, value: collateral, fill: '#f59e0b' },
       { name: t.dashboard.loan, value: securedDebt, fill: '#ef4444' },
       { name: t.dashboard.unsecured, value: unsecuredDebt, fill: '#991b1b' }
@@ -777,12 +944,12 @@ export default function App() {
 
   const rebalanceData: RebalanceAction[] = useMemo(() => {
     return assets
-      .filter(asset => !isLiability(asset.category)) 
+      .filter(asset => !isLiability(asset.category))
       .map(asset => {
         const currentValue = asset.quantity * asset.currentPrice;
         const targetValue = totalAssets * (asset.targetAllocation / 100);
         const difference = targetValue - currentValue;
-        
+
         let action: 'Buy' | 'Sell' | 'Hold' = 'Hold';
         if (difference > 100) action = 'Buy';
         if (difference < -100) action = 'Sell';
@@ -801,34 +968,30 @@ export default function App() {
   // Handlers
   const handleSync = async () => {
     setIsSyncing(true);
-    
-    // Check if we have Sheet ID configured
-    if (sheetId && sheetRange) {
-      try {
+
+    try {
+      if (sheetId && sheetRange) {
         const sheetAssets = await fetchSheetData(sheetId, sheetRange);
         if (sheetAssets.length > 0) {
           setAssets(sheetAssets);
-          // Small delay to show loading state
           await new Promise(r => setTimeout(r, 800));
         } else {
           alert("Connected to sheet, but found no data. Check your range.");
         }
-      } catch (e) {
-        console.error(e);
-        alert("Sync Failed: " + (e as Error).message + "\nCheck API Key or Sheet Permissions.");
-      }
-    } else {
-      // Simulate real-time price fluctuation if no sheet configured
-      setTimeout(() => {
+      } else {
+        await new Promise(r => setTimeout(r, 800));
         setAssets(prev => prev.map(a => ({
           ...a,
           currentPrice: isLiability(a.category) ? a.currentPrice : a.currentPrice * (1 + (Math.random() * 0.04 - 0.02)),
           change24h: (Math.random() * 5 - 2.5)
         })));
-      }, 1500);
+      }
+    } catch (e) {
+      console.error(e);
+      alert("Sync Failed: " + (e as Error).message + "\nCheck API Key or Sheet Permissions.");
+    } finally {
+      setIsSyncing(false);
     }
-    
-    setIsSyncing(false);
   };
 
   const handleAnalyze = async () => {
@@ -840,6 +1003,55 @@ export default function App() {
 
   const updateAsset = (id: string, field: keyof Asset, value: any) => {
     setAssets(prev => prev.map(a => a.id === id ? { ...a, [field]: value } : a));
+  };
+
+  const updateNumericAsset = (id: string, field: keyof Asset, value: string) => {
+    updateAsset(id, field, toFiniteNumber(value));
+  };
+
+  const handleExportCsv = () => {
+    const csv = assetsToCsv(assets);
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+
+    link.href = url;
+    link.download = `portfolio-assets-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImportCsv = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+
+    try {
+      const importedAssets = parseAssetsFromCsv(await file.text());
+      if (importedAssets.length === 0) {
+        alert(language === 'zh' ? 'CSV 沒有可匯入的資料。' : 'No importable rows were found in the CSV.');
+        return;
+      }
+
+      setAssets(importedAssets);
+      alert(language === 'zh' ? `已匯入 ${importedAssets.length} 筆資料。` : `Imported ${importedAssets.length} rows.`);
+    } catch (error) {
+      console.error(error);
+      alert(language === 'zh' ? 'CSV 匯入失敗，請確認檔案格式。' : 'CSV import failed. Please check the file format.');
+    }
+  };
+
+  const handleSaveSettings = () => {
+    const normalizedConfig = {
+      spreadsheetId: sheetId.trim(),
+      range: sheetRange.trim() || DEFAULT_SHEET_RANGE
+    };
+
+    setSheetConfig(normalizedConfig);
+    saveSheetConfig(normalizedConfig);
+    alert(language === 'zh' ? '設定已儲存。' : 'Settings saved.');
   };
 
   const addAsset = () => {
@@ -870,13 +1082,13 @@ export default function App() {
 
   return (
     <div className="bg-background min-h-screen text-slate-100 font-sans">
-      <Sidebar 
-        currentView={view} 
-        setView={setView} 
+      <Sidebar
+        currentView={view}
+        setView={setView}
         language={language}
         setLanguage={setLanguage}
       />
-      
+
       <main className="ml-20 md:ml-64 p-6 md:p-10 transition-all">
         {/* Header */}
         <header className="flex justify-between items-center mb-8">
@@ -891,7 +1103,7 @@ export default function App() {
             <p className="text-slate-400 mt-1">{t.header.welcome}</p>
           </div>
           <div className="flex gap-3">
-             <button 
+             <button
               onClick={handleSync}
               disabled={isSyncing}
               className={`flex items-center gap-2 px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-slate-300 hover:text-white hover:bg-slate-700 transition-all ${isSyncing ? 'animate-pulse' : ''}`}
@@ -899,7 +1111,10 @@ export default function App() {
               <RefreshCw size={18} className={isSyncing ? 'animate-spin' : ''} />
               {isSyncing ? t.header.syncing : t.header.sync}
             </button>
-            <button className="flex items-center gap-2 px-4 py-2 bg-primary hover:bg-blue-600 text-white rounded-lg font-medium transition-colors shadow-lg shadow-blue-500/20">
+            <button
+              onClick={handleExportCsv}
+              className="flex items-center gap-2 px-4 py-2 bg-primary hover:bg-blue-600 text-white rounded-lg font-medium transition-colors shadow-lg shadow-blue-500/20"
+            >
               <Download size={18} /> {t.header.export}
             </button>
           </div>
@@ -910,23 +1125,23 @@ export default function App() {
           <div className="space-y-6">
             {/* Top Stat Row: Net Worth + PnL Metrics */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-              <StatCard 
+              <StatCard
                 title={t.dashboard.netWorth}
-                value={`$${netWorth.toLocaleString('en-US', { maximumFractionDigits: 0 })}`} 
+                value={`$${netWorth.toLocaleString('en-US', { maximumFractionDigits: 0 })}`}
                 trend="up"
                 subtext={`${t.dashboard.assets}: $${totalAssets.toLocaleString(undefined, {maximumFractionDigits: 0})}`}
               />
-              <MetricCard 
+              <MetricCard
                 title={t.dashboard.dailyChange}
                 value={dailyPnL}
                 percent={totalAssets > 0 ? (dailyPnL / totalAssets) * 100 : 0}
               />
-              <MetricCard 
+              <MetricCard
                 title={t.dashboard.totalPnL}
                 value={totalPnL}
                 percent={assets.reduce((s,a) => s + (a.costBasis*a.quantity), 0) > 0 ? (totalPnL / assets.reduce((s,a) => s + (a.costBasis*a.quantity), 0)) * 100 : 0}
               />
-              <MetricCard 
+              <MetricCard
                 title={t.dashboard.ytd}
                 value={ytdPnL}
                 percent={ytdPercent}
@@ -934,13 +1149,13 @@ export default function App() {
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-              <StatCard 
+              <StatCard
                 title={t.dashboard.monthlyFlow}
                 value={`$${(monthlyIncome - monthlyInterest).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
                 valueColor={(monthlyIncome - monthlyInterest) >= 0 ? 'text-emerald-400' : 'text-red-400'}
                 subtext={`+${monthlyIncome.toFixed(0)} (Inc) / -${monthlyInterest.toFixed(0)} (Exp)`}
               />
-              <StatCard 
+              <StatCard
                 title={t.dashboard.rebalanceNeeded}
                 value={rebalanceData.filter(d => d.action !== 'Hold').length > 0 ? t.dashboard.yes : t.dashboard.no}
                 subtext={rebalanceData.filter(d => d.action !== 'Hold').length > 0 ? `${rebalanceData.filter(d => d.action !== 'Hold').length} ${t.dashboard.assetsAdrift}` : t.dashboard.balanced}
@@ -958,7 +1173,7 @@ export default function App() {
                       <CartesianGrid strokeDasharray="3 3" stroke="#334155" horizontal={false} />
                       <XAxis type="number" stroke="#64748b" tickFormatter={(v) => `$${v/1000}k`} />
                       <YAxis dataKey="name" type="category" stroke="#94a3b8" width={100} style={{ fontSize: '10px' }} />
-                      <ReTooltip 
+                      <ReTooltip
                         formatter={(value: number) => `$${value.toLocaleString()}`}
                         contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155', color: '#fff' }}
                       />
@@ -981,7 +1196,7 @@ export default function App() {
                       <CartesianGrid strokeDasharray="3 3" stroke="#334155" vertical={false} />
                       <XAxis dataKey="name" stroke="#64748b" />
                       <YAxis stroke="#64748b" tickFormatter={(v) => `$${v}`} />
-                      <ReTooltip 
+                      <ReTooltip
                         formatter={(value: number) => `$${value.toFixed(2)}`}
                         contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155', color: '#fff' }}
                       />
@@ -1014,7 +1229,7 @@ export default function App() {
                           <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
                         ))}
                       </Pie>
-                      <ReTooltip 
+                      <ReTooltip
                         formatter={(value: number) => `$${value.toLocaleString()}`}
                         contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155', color: '#fff' }}
                       />
@@ -1031,7 +1246,7 @@ export default function App() {
                     <BrainCircuit className="text-purple-400" />
                     {t.dashboard.aiInsights}
                   </h3>
-                  <button 
+                  <button
                     onClick={handleAnalyze}
                     disabled={isAnalyzing}
                     className="text-xs px-3 py-1 bg-purple-500/20 text-purple-300 rounded hover:bg-purple-500/30 transition-colors"
@@ -1039,7 +1254,7 @@ export default function App() {
                     {isAnalyzing ? t.dashboard.thinking : t.dashboard.generateAnalysis}
                   </button>
                 </div>
-                
+
                 <div className="flex-1 bg-slate-900/50 rounded-lg p-4 text-sm text-slate-300 overflow-y-auto max-h-64">
                   {aiAnalysis ? (
                     <div className="prose prose-invert prose-sm">
@@ -1065,8 +1280,8 @@ export default function App() {
               <button
                 onClick={() => setAssetSubView('list')}
                 className={`px-4 py-2 rounded-md text-sm font-medium transition-all ${
-                  assetSubView === 'list' 
-                    ? 'bg-primary text-white shadow' 
+                  assetSubView === 'list'
+                    ? 'bg-primary text-white shadow'
                     : 'text-slate-400 hover:text-white hover:bg-slate-700'
                 }`}
               >
@@ -1075,8 +1290,8 @@ export default function App() {
               <button
                 onClick={() => setAssetSubView('pledge')}
                 className={`px-4 py-2 rounded-md text-sm font-medium transition-all flex items-center gap-2 ${
-                  assetSubView === 'pledge' 
-                    ? 'bg-primary text-white shadow' 
+                  assetSubView === 'pledge'
+                    ? 'bg-primary text-white shadow'
                     : 'text-slate-400 hover:text-white hover:bg-slate-700'
                 }`}
               >
@@ -1093,10 +1308,20 @@ export default function App() {
                     <p className="text-slate-400 text-sm">{t.assets.subtitle}</p>
                   </div>
                   <div className="flex gap-2">
-                    <button className="flex items-center gap-2 px-3 py-1.5 bg-slate-800 text-slate-300 rounded text-sm hover:bg-slate-700">
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept=".csv,text/csv"
+                      className="hidden"
+                      onChange={handleImportCsv}
+                    />
+                    <button
+                      onClick={() => fileInputRef.current?.click()}
+                      className="flex items-center gap-2 px-3 py-1.5 bg-slate-800 text-slate-300 rounded text-sm hover:bg-slate-700"
+                    >
                       <FileSpreadsheet size={16} /> {t.assets.import}
                     </button>
-                    <button 
+                    <button
                       onClick={addAsset}
                       className="flex items-center gap-2 px-3 py-1.5 bg-accent text-white rounded text-sm hover:bg-emerald-600 font-medium"
                     >
@@ -1104,7 +1329,7 @@ export default function App() {
                     </button>
                   </div>
                 </div>
-                
+
                 <div className="overflow-x-auto">
                   <table className="w-full text-left border-collapse min-w-[1200px]">
                     <thead>
@@ -1129,7 +1354,7 @@ export default function App() {
                         <tr key={asset.id} className={`hover:bg-slate-700/30 transition-colors ${isLiability(asset.category) ? 'bg-red-900/10' : ''}`}>
                           <td className="p-4 text-center">
                             {!isLiability(asset.category) && (
-                              <button 
+                              <button
                                 onClick={() => updateAsset(asset.id, 'isCollateral', !asset.isCollateral)}
                                 className={`transition-colors ${asset.isCollateral ? 'text-amber-400' : 'text-slate-600 hover:text-slate-400'}`}
                               >
@@ -1138,29 +1363,29 @@ export default function App() {
                             )}
                           </td>
                           <td className="p-4">
-                            <input 
-                              value={asset.symbol} 
+                            <input
+                              value={asset.symbol}
                               onChange={(e) => updateAsset(asset.id, 'symbol', e.target.value)}
                               className="bg-transparent border border-transparent hover:border-slate-600 focus:border-primary rounded px-2 py-1 w-20 uppercase font-mono font-bold text-white outline-none"
                             />
                           </td>
                           <td className="p-4">
-                            <input 
-                              value={asset.name} 
+                            <input
+                              value={asset.name}
                               onChange={(e) => updateAsset(asset.id, 'name', e.target.value)}
                               className="bg-transparent border border-transparent hover:border-slate-600 focus:border-primary rounded px-2 py-1 w-full text-slate-300 outline-none"
                             />
                           </td>
                           <td className="p-4">
-                            <input 
-                              value={asset.location || ''} 
+                            <input
+                              value={asset.location || ''}
                               placeholder={t.pledge.locationPlaceholder}
                               onChange={(e) => updateAsset(asset.id, 'location', e.target.value)}
                               className="bg-transparent border border-slate-700 hover:border-slate-500 focus:border-primary rounded px-2 py-1 w-full text-slate-300 text-xs outline-none"
                             />
                           </td>
                           <td className="p-4">
-                            <select 
+                            <select
                               value={asset.category}
                               onChange={(e) => updateAsset(asset.id, 'category', e.target.value)}
                               className="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-xs text-slate-300 outline-none focus:border-primary"
@@ -1169,20 +1394,20 @@ export default function App() {
                             </select>
                           </td>
                           <td className="p-4 text-right">
-                            <input 
-                              type="number"
-                              value={asset.quantity} 
-                              onChange={(e) => updateAsset(asset.id, 'quantity', parseFloat(e.target.value))}
-                              className="bg-transparent border border-transparent hover:border-slate-600 focus:border-primary rounded px-2 py-1 w-20 text-right text-slate-300 outline-none"
-                            />
+                              <input
+                                type="number"
+                                value={asset.quantity}
+                                onChange={(e) => updateNumericAsset(asset.id, 'quantity', e.target.value)}
+                                className="bg-transparent border border-transparent hover:border-slate-600 focus:border-primary rounded px-2 py-1 w-20 text-right text-slate-300 outline-none"
+                              />
                           </td>
                           <td className="p-4 text-right">
-                            <input 
-                              type="number"
-                              value={asset.currentPrice} 
-                              onChange={(e) => updateAsset(asset.id, 'currentPrice', parseFloat(e.target.value))}
-                              className="bg-transparent border border-transparent hover:border-slate-600 focus:border-primary rounded px-2 py-1 w-20 text-right text-slate-300 outline-none"
-                            />
+                              <input
+                                type="number"
+                                value={asset.currentPrice}
+                                onChange={(e) => updateNumericAsset(asset.id, 'currentPrice', e.target.value)}
+                                className="bg-transparent border border-transparent hover:border-slate-600 focus:border-primary rounded px-2 py-1 w-20 text-right text-slate-300 outline-none"
+                              />
                           </td>
                           <td className="p-4 text-right">
                              {!isLiability(asset.category) && (
@@ -1196,10 +1421,10 @@ export default function App() {
                           </td>
                           <td className="p-4 text-center">
                             {asset.isCollateral && !isLiability(asset.category) ? (
-                              <input 
+                              <input
                                 type="number"
-                                value={asset.maxLTV || 0} 
-                                onChange={(e) => updateAsset(asset.id, 'maxLTV', parseFloat(e.target.value))}
+                                value={asset.maxLTV || 0}
+                                onChange={(e) => updateNumericAsset(asset.id, 'maxLTV', e.target.value)}
                                 className="bg-transparent border border-slate-700 hover:border-amber-400 focus:border-amber-500 rounded px-1 py-1 w-12 text-center text-amber-400 outline-none text-xs"
                                 placeholder="%"
                               />
@@ -1207,10 +1432,10 @@ export default function App() {
                           </td>
                           <td className="p-4 text-center">
                             {asset.isCollateral && !isLiability(asset.category) ? (
-                              <input 
+                              <input
                                 type="number"
-                                value={asset.liquidationThreshold || 0} 
-                                onChange={(e) => updateAsset(asset.id, 'liquidationThreshold', parseFloat(e.target.value))}
+                                value={asset.liquidationThreshold || 0}
+                                onChange={(e) => updateNumericAsset(asset.id, 'liquidationThreshold', e.target.value)}
                                 className="bg-transparent border border-slate-700 hover:border-red-400 focus:border-red-500 rounded px-1 py-1 w-12 text-center text-red-400 outline-none text-xs"
                                 placeholder="%"
                               />
@@ -1219,10 +1444,10 @@ export default function App() {
                           <td className="p-4 text-center">
                             {!isLiability(asset.category) ? (
                               <div className="flex items-center justify-center gap-1">
-                                <input 
+                                <input
                                   type="number"
-                                  value={asset.targetAllocation} 
-                                  onChange={(e) => updateAsset(asset.id, 'targetAllocation', parseFloat(e.target.value))}
+                                  value={asset.targetAllocation}
+                                  onChange={(e) => updateNumericAsset(asset.id, 'targetAllocation', e.target.value)}
                                   className="bg-transparent border border-transparent hover:border-slate-600 focus:border-primary rounded px-1 py-1 w-12 text-center text-slate-300 outline-none"
                                 />
                                 <span className="text-slate-500">%</span>
@@ -1232,7 +1457,7 @@ export default function App() {
                             )}
                           </td>
                           <td className="p-4 text-center">
-                            <button 
+                            <button
                               onClick={() => deleteAsset(asset.id)}
                               className="text-slate-500 hover:text-red-400 transition-colors"
                             >
@@ -1278,12 +1503,12 @@ export default function App() {
                              </span>
                            </div>
                            <div className="h-2 w-full bg-slate-800 rounded-full overflow-hidden relative">
-                              <div 
-                                className="absolute top-0 left-0 h-full bg-slate-600 opacity-30" 
+                              <div
+                                className="absolute top-0 left-0 h-full bg-slate-600 opacity-30"
                                 style={{ width: `${asset?.targetAllocation}%` }}
                               />
-                              <div 
-                                className={`h-full rounded-full transition-all duration-500 ${item.difference > 0 ? 'bg-red-400' : 'bg-emerald-400'}`} 
+                              <div
+                                className={`h-full rounded-full transition-all duration-500 ${item.difference > 0 ? 'bg-red-400' : 'bg-emerald-400'}`}
                                 style={{ width: `${currentPercent}%` }}
                               />
                            </div>
@@ -1307,7 +1532,7 @@ export default function App() {
                       <div className="space-y-3">
                         {rebalanceData.filter(r => r.action !== 'Hold').map((item) => {
                            let actionLabel = item.action === 'Buy' ? t.rebalance.buy : t.rebalance.sell;
-                           
+
                            return (
                            <div key={item.assetId} className="flex items-center justify-between p-4 bg-slate-900/50 rounded-lg border-l-4 border-l-transparent hover:border-l-primary transition-all">
                               <div className="flex items-center gap-3">
@@ -1335,7 +1560,7 @@ export default function App() {
              </div>
           </div>
         )}
-        
+
         {/* --- GUIDE VIEW --- */}
         {view === 'guide' && (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -1346,7 +1571,7 @@ export default function App() {
               </div>
               <p className="text-slate-400">{t.guide.cards.sync.desc}</p>
             </div>
-            
+
             <div className="bg-surface p-6 rounded-xl border border-slate-700">
               <div className="flex items-center gap-3 mb-3 text-emerald-400">
                 <Banknote size={24} />
@@ -1354,7 +1579,7 @@ export default function App() {
               </div>
               <p className="text-slate-400">{t.guide.cards.assets.desc}</p>
             </div>
-            
+
             <div className="bg-surface p-6 rounded-xl border border-slate-700">
               <div className="flex items-center gap-3 mb-3 text-amber-400">
                 <ArrowRightLeft size={24} />
@@ -1362,7 +1587,7 @@ export default function App() {
               </div>
               <p className="text-slate-400">{t.guide.cards.rebalance.desc}</p>
             </div>
-            
+
              <div className="bg-surface p-6 rounded-xl border border-slate-700">
               <div className="flex items-center gap-3 mb-3 text-purple-400">
                 <BrainCircuit size={24} />
@@ -1383,7 +1608,7 @@ export default function App() {
                   <p className="text-slate-400">{t.settings.desc}</p>
                 </div>
              </div>
-             
+
              <div className="space-y-6">
                <div className="p-4 bg-slate-900/50 rounded-lg border border-slate-800">
                  <h3 className="font-bold text-emerald-400 mb-2 flex items-center gap-2">
@@ -1392,8 +1617,8 @@ export default function App() {
                  <div className="space-y-4 mt-4">
                     <div>
                       <label className="block text-xs font-bold text-slate-500 uppercase mb-1">{t.settings.sheetId}</label>
-                      <input 
-                        type="text" 
+                      <input
+                        type="text"
                         value={sheetId}
                         onChange={(e) => setSheetId(e.target.value)}
                         placeholder="1BxiMVs0XRA5nFMdKvBdBkJ..."
@@ -1402,8 +1627,8 @@ export default function App() {
                     </div>
                     <div>
                       <label className="block text-xs font-bold text-slate-500 uppercase mb-1">{t.settings.sheetRange}</label>
-                      <input 
-                        type="text" 
+                      <input
+                        type="text"
                         value={sheetRange}
                         onChange={(e) => setSheetRange(e.target.value)}
                         placeholder="Sheet1!A2:M"
@@ -1413,7 +1638,10 @@ export default function App() {
                  </div>
                </div>
 
-               <button className="w-full py-3 bg-primary hover:bg-blue-600 rounded-lg font-bold transition-colors flex items-center justify-center gap-2">
+               <button
+                 onClick={handleSaveSettings}
+                 className="w-full py-3 bg-primary hover:bg-blue-600 rounded-lg font-bold transition-colors flex items-center justify-center gap-2"
+               >
                  <Save size={18} /> {t.settings.save}
                </button>
              </div>
